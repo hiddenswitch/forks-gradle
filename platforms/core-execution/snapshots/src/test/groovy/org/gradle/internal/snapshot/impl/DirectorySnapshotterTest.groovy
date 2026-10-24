@@ -43,7 +43,14 @@ import org.junit.Rule
 import spock.lang.Issue
 import spock.lang.Specification
 
+import java.nio.file.FileStore
+import java.nio.file.FileSystem
+import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
+import java.nio.file.spi.FileSystemProvider
 import java.util.function.Consumer
 
 @UsesNativeServices
@@ -58,6 +65,84 @@ class DirectorySnapshotterTest extends Specification {
     List<FileSystemLocationSnapshot> unfilteredSubsnapshots = []
     Consumer<FileSystemLocationSnapshot> unfilteredSubSnapshotsCollector = { FileSystemLocationSnapshot snapshot ->
         unfilteredSubsnapshots.add(snapshot)
+    }
+
+    def "hashes readable reparse files on #storeType and detects content changes"() {
+        given:
+        def file = tmpDir.file("deduplicated.txt").createFile()
+        file.text = "before"
+        def fileSystemProvider = Stub(FileSystemProvider) {
+            getFileStore(_) >> Stub(FileStore) { type() >> storeType }
+        }
+        def fs = Stub(FileSystem) { provider() >> fileSystemProvider }
+        def path = Stub(Path) {
+            getFileSystem() >> fs
+            toFile() >> file
+        }
+        def attrs = Stub(BasicFileAttributes) {
+            isOther() >> true
+            size() >> { file.length() }
+            lastModifiedTime() >> { FileTime.fromMillis(file.lastModified()) }
+        }
+        assert attrs.isOther()
+        assert Files.getFileStore(path).type() == storeType
+
+        when:
+        def first = DirectorySnapshotter.snapshotFile(path, file.absolutePath, file.name, attrs, AccessType.DIRECT, fileHasher)
+        file.text = "after!"
+        def second = DirectorySnapshotter.snapshotFile(path, file.absolutePath, file.name, attrs, AccessType.DIRECT, fileHasher)
+
+        then:
+        first instanceof RegularFileSnapshot
+        second instanceof RegularFileSnapshot
+        first.hash != second.hash
+        first.absolutePath == file.absolutePath
+        second.metadata.length == file.length()
+
+        where:
+        storeType << ["NTFS", "ReFS"]
+    }
+
+    def "rejects special files on unsupported or unreadable file stores"() {
+        given:
+        def fileSystemProvider = Stub(FileSystemProvider) {
+            getFileStore(_) >> {
+                if (lookupFails) throw new IOException("store unavailable")
+                Stub(FileStore) { type() >> "ext4" }
+            }
+        }
+        def fs = Stub(FileSystem) { provider() >> fileSystemProvider }
+        def path = Stub(Path) { getFileSystem() >> fs }
+        def attrs = Stub(BasicFileAttributes) { isOther() >> true }
+
+        when:
+        DirectorySnapshotter.snapshotFile(path, "/special", "special", attrs, AccessType.DIRECT, fileHasher)
+
+        then:
+        def failure = thrown(Exception)
+        failure.message.contains("not a regular file")
+
+        where:
+        lookupFails << [false, true]
+    }
+
+    def "regular files and symbolic links do not query the file store"() {
+        given:
+        def file = tmpDir.file("regular.txt").createFile()
+        file.text = "ordinary file"
+        def path = Mock(Path)
+        def attrs = Files.readAttributes(file.toPath(), BasicFileAttributes)
+        def symbolic = Stub(BasicFileAttributes) { isSymbolicLink() >> true }
+
+        when:
+        def regular = DirectorySnapshotter.snapshotFile(path, file.absolutePath, file.name, attrs, AccessType.DIRECT, fileHasher)
+        def missing = DirectorySnapshotter.snapshotFile(path, file.absolutePath, file.name, symbolic, AccessType.DIRECT, fileHasher)
+
+        then:
+        1 * path.toFile() >> file
+        0 * path._
+        regular instanceof RegularFileSnapshot
+        missing instanceof MissingFileSnapshot
     }
 
     def "should snapshot without filters"() {
